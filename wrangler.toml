@@ -5,3 +5,15 @@ compatibility_date = "2024-01-01"
 [[kv_namespaces]]
 binding = "TG_BOT_KV"
 id = "0356a15a1f3442d28dfd132869bc1e26"
+
+
+# 2. 生产环境配置
+[vars]
+# 默认管理员账号
+ADMIN_USER = "admin"
+# 会话密钥（建议是一串很长的随机字符串，用于加密 Cookie）
+SESSION_SECRET = "super-secret-random-string-12345喵喵喵🏳️‍🌈🏳️‍⚧️"
+
+# 注意：ADMIN_PASS（密码）属于敏感信息
+# 强烈建议不要写在配置文件里，而是通过 Cloudflare 控制台的 Settings -> Variables -> Secrets 添加
+# 或者使用命令：wrangler secret put ADMIN_PASS
