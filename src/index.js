@@ -1,61 +1,73 @@
+/**
+ * Telegram Bot 管理系统 - 完整版
+ * 功能：多机器人管理、Webhook自动配置、移动端适配 UI、Cookie 鉴权
+ */
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
-    const cookie = request.headers.get("Cookie") || "";
-    // 校验 Session
-    const isAuthed = cookie.includes(`session=${env.SESSION_SECRET}`);
+    
+    // 获取并解析 Cookie
+    const cookieHeader = request.headers.get("Cookie") || "";
+    const cookies = Object.fromEntries(cookieHeader.split('; ').map(x => x.split('=')));
+    const isAuthed = cookies['session'] === env.SESSION_SECRET && env.SESSION_SECRET !== undefined;
 
-    // 1. 登录路由
+    // 1. 登录页面渲染
     if (path === "/login") {
       if (isAuthed) return Response.redirect(`${url.origin}/admin`, 302);
       return new Response(renderLoginHTML(), { headers: { "Content-Type": "text/html;charset=UTF-8" } });
     }
 
-    // 2. 登录接口
+    // 2. 登录接口 (POST /api/login)
     if (path === "/api/login" && request.method === "POST") {
       try {
-        const { user, pass } = await request.json();
+        const body = await request.json();
+        const { user, pass } = body;
+
+        // 严格校验环境变量
         if (user === env.ADMIN_USER && pass === env.ADMIN_PASS) {
+          const secret = env.SESSION_SECRET || "fallback_secret";
           return new Response(JSON.stringify({ success: true }), {
             headers: {
-              "Set-Cookie": `session=${env.SESSION_SECRET}; HttpOnly; Path=/; Max-Age=86400; SameSite=Strict; Secure`,
+              // 适配移动端和不同域名的 Cookie 设置
+              "Set-Cookie": `session=${secret}; HttpOnly; Path=/; Max-Age=86400; SameSite=Lax; Secure`,
               "Content-Type": "application/json"
             }
           });
         }
-        return new Response(JSON.stringify({ success: false, msg: "凭据错误" }), { status: 401 });
+        return new Response(JSON.stringify({ success: false, msg: "账号或密码错误" }), { status: 401 });
       } catch (e) {
-        return new Response(JSON.stringify({ success: false, msg: "数据格式错误" }), { status: 400 });
+        return new Response(JSON.stringify({ success: false, msg: "非法请求" }), { status: 400 });
       }
     }
 
-    // --- 权限拦截 ---
-    if (!isAuthed && (path.startsWith("/api/") || path === "/admin" || path === "/")) {
+    // --- 鉴权拦截器 ---
+    if (!isAuthed && (path === "/admin" || path === "/" || path.startsWith("/api/"))) {
       return Response.redirect(`${url.origin}/login`, 302);
     }
 
-    // 3. 管理后台
+    // 3. 管理后台主页
     if ((path === "/admin" || path === "/") && request.method === "GET") {
       return new Response(renderAdminHTML(), { headers: { "Content-Type": "text/html;charset=UTF-8" } });
     }
 
-    // 4. API: 获取列表
+    // 4. API: 获取机器人列表
     if (path === "/api/bots" && request.method === "GET") {
       const list = await env.TG_BOT_KV.list({ prefix: "BOT_" });
       const bots = await Promise.all(list.keys.map(async (k) => JSON.parse(await env.TG_BOT_KV.get(k.name))));
       return new Response(JSON.stringify(bots), { headers: { "Content-Type": "application/json" } });
     }
 
-    // 5. API: 保存并设置 Webhook
+    // 5. API: 保存机器人配置并激活 Webhook
     if (path === "/api/save" && request.method === "POST") {
       const config = await request.json();
-      if (!config.token) return new Response(JSON.stringify({ success: false, msg: "Token必填" }));
-      
+      if (!config.token) return new Response(JSON.stringify({ success: false, msg: "Missing Token" }));
+
       const tokenHash = await sha256(config.token);
       await env.TG_BOT_KV.put(`BOT_${tokenHash}`, JSON.stringify(config));
 
-      // 调用 TG API 设置 Webhook
+      // 注册 Webhook 到 Telegram
       const webhookUrl = `https://${url.hostname}/webhook/${tokenHash}`;
       const tgRes = await fetch(`https://api.telegram.org/bot${config.token}/setWebhook?url=${webhookUrl}`);
       const tgData = await tgRes.json();
@@ -63,11 +75,12 @@ export default {
       return new Response(JSON.stringify({ success: tgData.ok, msg: tgData.description }));
     }
 
-    // 6. 机器人消息入口
+    // 6. Webhook 消息处理入口
     if (path.startsWith("/webhook/")) {
       const tokenHash = path.split("/")[2];
       const configRaw = await env.TG_BOT_KV.get(`BOT_${tokenHash}`);
-      if (!configRaw) return new Response("Error", { status: 404 });
+      if (!configRaw) return new Response("Bot Not Found", { status: 404 });
+      
       const update = await request.json();
       return await handleBotUpdate(update, JSON.parse(configRaw));
     }
@@ -76,16 +89,17 @@ export default {
   }
 };
 
-// --- 工具函数 ---
+/** 辅助函数：计算哈希 */
 async function sha256(str) {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
   return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
+/** 核心逻辑：处理 Telegram 消息 */
 async function handleBotUpdate(update, config) {
   if (update.message?.text) {
     const text = update.message.text;
-    const reply = config.rules?.[text] || (text === "/start" ? "机器人已激活" : null);
+    const reply = config.rules?.[text] || (text === "/start" ? "👋 机器人已就绪" : null);
     if (reply) {
       await fetch(`https://api.telegram.org/bot${config.token}/sendMessage`, {
         method: "POST",
@@ -97,87 +111,98 @@ async function handleBotUpdate(update, config) {
   return new Response("OK");
 }
 
-// --- 移动端兼容 HTML 模板 ---
-function getCommonHead(title) {
-  return `
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>${title}</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
-  `;
-}
+/** 移动端优化公共头部 */
+const commonHead = `
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+  <style>
+    .glass { background: rgba(255, 255, 255, 0.8); backdrop-filter: blur(10px); }
+    .btn-active:active { transform: scale(0.96); }
+  </style>
+`;
 
+/** 登录页面 */
 function renderLoginHTML() {
-  return `<!DOCTYPE html><html><head>${getCommonHead('登录')}</head>
-  <body class="bg-slate-50 flex items-center justify-center min-h-screen p-4">
-    <div class="bg-white p-8 rounded-2xl shadow-xl w-full max-w-sm">
-      <h2 class="text-2xl font-bold mb-6 text-gray-800 text-center">Bot System</h2>
+  return `<!DOCTYPE html><html><head>${commonHead}<title>Login</title></head>
+  <body class="bg-slate-900 flex items-center justify-center min-h-screen p-4">
+    <div class="bg-white p-8 rounded-3xl shadow-2xl w-full max-w-sm">
+      <div class="text-center mb-8">
+        <h1 class="text-3xl font-black text-slate-800">Admin</h1>
+        <p class="text-slate-400 text-sm mt-2">请输入凭据进入管理控制台</p>
+      </div>
       <div class="space-y-4">
-        <input id="u" type="text" placeholder="管理账号" class="w-full border-gray-200 border p-3 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none">
-        <input id="p" type="password" placeholder="访问密码" class="w-full border-gray-200 border p-3 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none">
-        <button onclick="login()" id="btn" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-xl transition-all active:scale-95">进入管理后台</button>
+        <input id="u" type="text" placeholder="Username" class="w-full bg-slate-50 border-0 p-4 rounded-2xl focus:ring-2 focus:ring-blue-500 outline-none transition-all">
+        <input id="p" type="password" placeholder="Password" class="w-full bg-slate-50 border-0 p-4 rounded-2xl focus:ring-2 focus:ring-blue-500 outline-none transition-all">
+        <button onclick="login()" id="btn" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-4 rounded-2xl shadow-lg shadow-blue-200 btn-active transition-all">立即登录</button>
       </div>
     </div>
     <script>
       async function login(){
         const btn = document.getElementById('btn');
         btn.disabled = true; btn.innerText = '正在验证...';
-        try {
-          const res = await fetch('/api/login', {
-            method: 'POST',
-            body: JSON.stringify({user: document.getElementById('u').value, pass: document.getElementById('p').value})
-          });
-          if(res.ok) location.href='/admin';
-          else alert('账号或密码错误');
-        } finally {
-          btn.disabled = false; btn.innerText = '进入管理后台';
-        }
+        const res = await fetch('/api/login', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({user: document.getElementById('u').value, pass: document.getElementById('p').value})
+        });
+        if(res.ok) location.href='/admin';
+        else { alert('登录失败，请检查账号密码'); btn.disabled = false; btn.innerText = '立即登录'; }
       }
     </script>
   </body></html>`;
 }
 
+/** 管理后台 */
 function renderAdminHTML() {
-  return `<!DOCTYPE html><html><head>${getCommonHead('管理后台')}</head>
-  <body class="bg-gray-50 min-h-screen pb-20">
-    <div id="app" class="max-w-md mx-auto p-4 sm:max-w-2xl">
-      <header class="flex justify-between items-center py-6">
-        <h1 class="text-xl font-extrabold text-gray-900 tracking-tight">机器人列表</h1>
-        <button @click="openModal()" class="bg-black text-white px-4 py-2 rounded-lg text-sm font-medium active:scale-95 transition-transform">＋ 添加</button>
-      </header>
-
-      <div class="space-y-3">
-        <div v-for="bot in bots" class="bg-white p-4 rounded-xl shadow-sm border border-gray-100 flex justify-between items-center">
-          <div class="overflow-hidden">
-            <div class="font-bold text-gray-800 truncate">{{bot.name}}</div>
-            <div class="text-xs text-gray-400 font-mono">{{bot.token.slice(0,15)}}...</div>
-          </div>
-          <button @click="editBot(bot)" class="ml-4 text-blue-600 text-sm font-semibold">配置</button>
+  return `<!DOCTYPE html><html><head>${commonHead}<title>Admin Console</title></head>
+  <body class="bg-slate-50 min-h-screen">
+    <div id="app" class="max-w-xl mx-auto px-4 py-8">
+      <div class="flex justify-between items-end mb-10">
+        <div>
+          <h1 class="text-2xl font-black text-slate-900">Bot Manager</h1>
+          <p class="text-slate-500 text-xs mt-1">控制 Cloudflare Worker 上的机器人集群</p>
         </div>
-        <div v-if="bots.length === 0" class="text-center py-10 text-gray-400 text-sm">暂无机器人，点击右上角添加</div>
+        <button @click="openModal()" class="bg-blue-600 text-white px-5 py-2.5 rounded-xl text-sm font-bold btn-active shadow-md">＋ 新增</button>
+      </div>
+
+      <div class="space-y-4">
+        <div v-for="bot in bots" class="bg-white p-5 rounded-2xl shadow-sm border border-slate-100 flex justify-between items-center">
+          <div class="truncate mr-4">
+            <h3 class="font-bold text-slate-800 truncate">{{bot.name}}</h3>
+            <p class="text-[10px] font-mono text-slate-300 mt-1 truncate">{{bot.token}}</p>
+          </div>
+          <button @click="editBot(bot)" class="text-blue-600 font-bold text-sm shrink-0 px-2 py-1">配置</button>
+        </div>
+        <div v-if="bots.length === 0" class="text-center py-20 text-slate-300 text-sm italic">点击右上角按钮开始添加机器人</div>
       </div>
 
       <div v-if="showModal" class="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4">
-        <div class="absolute inset-0 bg-black/40 backdrop-blur-sm" @click="showModal=false"></div>
-        <div class="relative bg-white w-full sm:max-w-lg rounded-t-3xl sm:rounded-2xl p-6 shadow-2xl animate-in slide-in-from-bottom duration-300">
-          <div class="w-12 h-1.5 bg-gray-200 rounded-full mx-auto mb-6 sm:hidden"></div>
-          <h3 class="text-lg font-bold mb-4">{{isEdit?'编辑配置':'添加机器人'}}</h3>
+        <div class="absolute inset-0 bg-slate-900/60 backdrop-blur-sm" @click="showModal=false"></div>
+        <div class="relative bg-white w-full sm:max-w-md rounded-t-[2.5rem] sm:rounded-3xl p-8 shadow-2xl animate-in slide-in-from-bottom duration-300">
+          <div class="w-12 h-1 bg-slate-200 rounded-full mx-auto mb-6 sm:hidden"></div>
+          <h2 class="text-xl font-black mb-6 text-slate-800">{{isEdit?'更新机器人':'新增机器人'}}</h2>
           
           <div class="space-y-4">
-            <input v-model="form.name" placeholder="显示名称 (如: 客服机器人)" class="w-full border-gray-100 border bg-gray-50 p-3 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none">
-            <input v-model="form.token" placeholder="Telegram Bot Token" class="w-full border-gray-100 border bg-gray-50 p-3 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none" :disabled="isEdit">
-            
             <div>
-              <label class="text-xs font-bold text-gray-400 mb-2 block uppercase tracking-wider">自动回复规则 (JSON格式)</label>
-              <textarea v-model="form.rules" placeholder='{"你好": "欢迎！"}' class="w-full border-gray-100 border bg-gray-50 p-3 rounded-xl h-32 font-mono text-sm focus:ring-2 focus:ring-blue-500 outline-none"></textarea>
+              <label class="text-[10px] font-bold text-slate-400 ml-1 mb-1 block">ROBOT NAME</label>
+              <input v-model="form.name" placeholder="例如：我的第一号机器人" class="w-full bg-slate-50 border-0 p-4 rounded-2xl outline-none focus:ring-2 focus:ring-blue-500">
+            </div>
+            <div v-if="!isEdit">
+              <label class="text-[10px] font-bold text-slate-400 ml-1 mb-1 block">BOT TOKEN</label>
+              <input v-model="form.token" placeholder="从 @BotFather 获取的 Token" class="w-full bg-slate-50 border-0 p-4 rounded-2xl outline-none focus:ring-2 focus:ring-blue-500 font-mono text-xs">
+            </div>
+            <div>
+              <label class="text-[10px] font-bold text-slate-400 ml-1 mb-1 block">REPLY RULES (JSON)</label>
+              <textarea v-model="form.rules" placeholder='{"/hi": "Hello!"}' class="w-full bg-slate-50 border-0 p-4 rounded-2xl outline-none focus:ring-2 focus:ring-blue-500 font-mono text-xs h-32"></textarea>
             </div>
 
-            <div class="flex flex-col gap-2 pt-2">
-              <button @click="save" :disabled="loading" class="w-full bg-blue-600 text-white font-bold py-4 rounded-2xl disabled:bg-gray-300 transition-all active:scale-95 shadow-lg shadow-blue-200">
-                {{ loading ? '正在请求 Telegram...' : '保存并下发 Webhook' }}
+            <div class="flex flex-col gap-3 pt-4">
+              <button @click="save" :disabled="loading" class="w-full bg-slate-900 text-white font-bold py-4 rounded-2xl btn-active disabled:bg-slate-200 transition-all">
+                {{ loading ? '⏳ 正在同步 Telegram...' : '保存并激活' }}
               </button>
-              <button @click="showModal=false" class="w-full py-3 text-gray-500 text-sm">取消</button>
+              <button @click="showModal=false" class="w-full text-slate-400 text-sm font-medium py-2">放弃更改</button>
             </div>
           </div>
         </div>
@@ -193,18 +218,18 @@ function renderAdminHTML() {
           openModal() { this.isEdit=false; this.form={name:'', token:'', rules:'{}'}; this.showModal=true; },
           editBot(bot) { this.isEdit=true; this.form={...bot, rules: JSON.stringify(bot.rules, null, 2)}; this.showModal=true; },
           async save() {
-            if(!this.form.name || !this.form.token) return alert('请完整填写');
-            this.loading = true;
+            if(!this.form.name || !this.form.token) return alert('信息填写不全');
+            this.loading = true; // 防连点逻辑
             try {
               const res = await fetch('/api/save', { 
                 method: 'POST', 
-                headers: { 'Content-Type': 'application/json' },
+                headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({...this.form, rules: JSON.parse(this.form.rules)}) 
               });
               const data = await res.json();
               if(data.success) { this.showModal=false; this.load(); }
               else { alert('错误: ' + data.msg); }
-            } catch(e) { alert('语法错误，请检查规则是否为有效的 JSON'); }
+            } catch(e) { alert('JSON 规则格式不正确'); }
             finally { this.loading = false; }
           }
         },
