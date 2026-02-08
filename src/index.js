@@ -4,9 +4,8 @@ export default {
     const path = url.pathname;
     const cookieHeader = request.headers.get("Cookie") || "";
     const cookies = Object.fromEntries(cookieHeader.split('; ').map(x => x.split('=')));
-    const isAuthed = cookies['session'] === env.SESSION_SECRET && env.SESSION_SECRET !== undefined;
+    const isAuthed = cookies['session'] === env.SESSION_SECRET;
 
-    // API: 登录
     if (path === "/api/login" && request.method === "POST") {
       const { user, pass } = await request.json();
       if (user === env.ADMIN_USER && pass === env.ADMIN_PASS) {
@@ -19,21 +18,33 @@ export default {
 
     if (path === "/login") return new Response(renderLoginHTML(), { headers: { "Content-Type": "text/html;charset=UTF-8" } });
 
-    // API: 管理后台数据
     if (isAuthed) {
       if (path === "/api/data" && request.method === "GET") {
         const bots = (await env.DB.prepare("SELECT * FROM bots").all()).results;
         const configs = (await env.DB.prepare("SELECT * FROM configs").all()).results;
-        return new Response(JSON.stringify({ bots, configs }));
+        const refs = (await env.DB.prepare("SELECT * FROM bot_config_refs").all()).results;
+        return new Response(JSON.stringify({ bots, configs, refs }));
       }
 
+      // 保存配置并更新关联的机器人
       if (path === "/api/config/save" && request.method === "POST") {
-        const item = await request.json();
-        // 这里的 rules 已经是处理好的 JSON 字符串了
-        if (item.id) {
-          await env.DB.prepare("UPDATE configs SET name = ?, rules = ? WHERE id = ?").bind(item.name, item.rules, item.id).run();
+        const { id, name, rules, botHashes } = await request.json();
+        let configId = id;
+        
+        if (id) {
+          await env.DB.prepare("UPDATE configs SET name = ?, rules = ? WHERE id = ?").bind(name, rules, id).run();
         } else {
-          await env.DB.prepare("INSERT INTO configs (name, rules) VALUES (?, ?)").bind(item.name, item.rules).run();
+          const res = await env.DB.prepare("INSERT INTO configs (name, rules) VALUES (?, ?)").bind(name, rules).run();
+          configId = res.meta.last_row_id;
+        }
+
+        // 更新多对多关联：先删后加
+        await env.DB.prepare("DELETE FROM bot_config_refs WHERE config_id = ?").bind(configId).run();
+        if (botHashes && botHashes.length > 0) {
+          const statements = botHashes.map(hash => 
+            env.DB.prepare("INSERT INTO bot_config_refs (bot_hash, config_id) VALUES (?, ?)").bind(hash, configId)
+          );
+          await env.DB.batch(statements);
         }
         return new Response(JSON.stringify({ success: true }));
       }
@@ -42,9 +53,9 @@ export default {
         const bot = await request.json();
         const tokenHash = await sha256(bot.token);
         await env.DB.prepare(`
-          INSERT INTO bots (token_hash, token, name, config_id) VALUES (?, ?, ?, ?)
-          ON CONFLICT(token_hash) DO UPDATE SET name=excluded.name, config_id=excluded.config_id, token=excluded.token
-        `).bind(tokenHash, bot.token, bot.name, bot.config_id || null).run();
+          INSERT INTO bots (token_hash, token, name) VALUES (?, ?, ?)
+          ON CONFLICT(token_hash) DO UPDATE SET name=excluded.name, token=excluded.token
+        `).bind(tokenHash, bot.token, bot.name).run();
         await fetch(`https://api.telegram.org/bot${bot.token}/setWebhook?url=https://${url.hostname}/webhook/${tokenHash}`);
         return new Response(JSON.stringify({ success: true }));
       }
@@ -53,32 +64,39 @@ export default {
     if (!isAuthed && (path === "/admin" || path === "/")) return Response.redirect(`${url.origin}/login`, 302);
     if (path === "/admin" || path === "/") return new Response(renderAdminHTML(), { headers: { "Content-Type": "text/html;charset=UTF-8" } });
 
-    // Webhook 逻辑
+    // Webhook：支持叠加多个配置的规则
     if (path.startsWith("/webhook/")) {
       const tokenHash = path.split("/")[2];
-      const botData = await env.DB.prepare(`
-        SELECT b.token, c.rules FROM bots b 
-        LEFT JOIN configs c ON b.config_id = c.id 
-        WHERE b.token_hash = ?
-      `).bind(tokenHash).first();
+      const data = await env.DB.prepare(`
+        SELECT c.rules FROM configs c
+        JOIN bot_config_refs r ON c.id = r.config_id
+        WHERE r.bot_hash = ?
+      `).bind(tokenHash).all();
 
-      if (!botData) return new Response("OK");
+      const botInfo = await env.DB.prepare("SELECT token FROM bots WHERE token_hash = ?").bind(tokenHash).first();
+      if (!botInfo || data.results.length === 0) return new Response("OK");
+
       const update = await request.json();
       const msg = update.message;
       if (!msg?.text) return new Response("OK");
 
       const pureCommand = msg.text.split(' ')[0].split('@')[0];
-      const rules = JSON.parse(botData.rules || '{}');
-      const reply = rules[pureCommand] || (pureCommand === "/start" ? "🤖 配置已生效" : null);
+      
+      // 合并所有关联配置的规则 (后加入的配置规则会覆盖前面的)
+      let combinedRules = {};
+      data.results.forEach(row => {
+        try { Object.assign(combinedRules, JSON.parse(row.rules)); } catch(e) {}
+      });
 
-      if (reply) await handleBotReply(msg, botData.token, reply);
+      const reply = combinedRules[pureCommand];
+      if (reply) await handleBotReply(msg, botInfo.token, reply);
       return new Response("OK");
     }
     return new Response("Not Found", { status: 404 });
   }
 };
 
-// 工具函数 (handleBotReply, sha256 保持一致...)
+// ... (handleBotReply 和 sha256 函数保持不变) ...
 async function handleBotReply(msg, token, replyTemplate) {
   const botUrl = `https://api.telegram.org/bot${token}`;
   const urls = replyTemplate.match(/(https?:\/\/[^\s]+)/g);
@@ -102,72 +120,80 @@ async function sha256(str) {
 
 function renderAdminHTML() {
   return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><script src="https://cdn.tailwindcss.com"></script><script src="https://unpkg.com/vue@3/dist/vue.global.js"></script><title>Bot Master</title></head>
-  <body class="bg-[#f8fafc] text-slate-900">
+  <body class="bg-[#f8fafc]">
     <div id="app" class="max-w-2xl mx-auto p-4 py-8">
       <div class="flex gap-2 mb-8 bg-white p-1.5 rounded-2xl shadow-sm border border-slate-200">
-        <button @click="tab='bots'" :class="tab==='bots'?'bg-blue-600 text-white shadow-md':'text-slate-400 hover:bg-slate-50'" class="flex-1 py-3 rounded-xl font-bold transition-all">机器人管理</button>
-        <button @click="tab='configs'" :class="tab==='configs'?'bg-blue-600 text-white shadow-md':'text-slate-400 hover:bg-slate-50'" class="flex-1 py-3 rounded-xl font-bold transition-all">公共配置库</button>
+        <button @click="tab='bots'" :class="tab==='bots'?'bg-blue-600 text-white':'text-slate-400'" class="flex-1 py-3 rounded-xl font-bold transition-all">机器人</button>
+        <button @click="tab='configs'" :class="tab==='configs'?'bg-blue-600 text-white':'text-slate-400'" class="flex-1 py-3 rounded-xl font-bold transition-all">规则配置</button>
       </div>
 
       <div v-if="tab==='bots'" class="space-y-4">
-        <div class="flex justify-between items-center mb-4">
-          <h2 class="text-2xl font-black italic text-slate-800 tracking-tighter">BOTS</h2>
-          <button @click="openBotModal()" class="bg-blue-600 text-white px-5 py-2 rounded-xl text-sm font-bold shadow-lg shadow-blue-200 hover:scale-105 transition-transform">添加机器人</button>
+        <div class="flex justify-between items-center px-2">
+          <h2 class="text-xl font-black">Bots</h2>
+          <button @click="openBotModal()" class="bg-black text-white px-4 py-2 rounded-xl text-sm">+ 添加</button>
         </div>
-        <div v-for="bot in bots" class="bg-white p-6 rounded-[2rem] border border-slate-200 shadow-sm flex justify-between items-center">
-          <div>
-            <p class="font-bold text-lg text-slate-800">{{bot.name}}</p>
-            <p class="text-[10px] text-slate-400 font-mono mt-1">Token: {{bot.token.slice(0,12)}}...</p>
-          </div>
-          <button @click="editBot(bot)" class="bg-slate-900 text-white px-4 py-2 rounded-xl font-bold text-sm">设置</button>
+        <div v-for="bot in bots" class="bg-white p-6 rounded-[2rem] border shadow-sm flex justify-between items-center">
+          <div><p class="font-bold">{{bot.name}}</p></div>
+          <button @click="editBot(bot)" class="text-blue-600 font-bold bg-blue-50 px-4 py-2 rounded-xl text-sm">编辑</button>
         </div>
       </div>
 
       <div v-if="tab==='configs'" class="space-y-4">
-        <div class="flex justify-between items-center mb-4">
-          <h2 class="text-2xl font-black italic text-slate-800 tracking-tighter">CONFIGS</h2>
-          <button @click="openConfigModal()" class="bg-blue-600 text-white px-5 py-2 rounded-xl text-sm font-bold shadow-lg shadow-blue-200 hover:scale-105 transition-transform">新建规则集</button>
+        <div class="flex justify-between items-center px-2">
+          <h2 class="text-xl font-black">Configs</h2>
+          <button @click="openConfigModal()" class="bg-black text-white px-4 py-2 rounded-xl text-sm">+ 新建规则集</button>
         </div>
-        <div v-for="cfg in configs" class="bg-white p-6 rounded-[2rem] border border-slate-200 shadow-sm flex justify-between items-center">
-          <p class="font-bold text-lg text-slate-800">{{cfg.name}}</p>
-          <button @click="editConfig(cfg)" class="text-blue-600 font-bold text-sm bg-blue-50 px-4 py-2 rounded-xl hover:bg-blue-100 transition-colors">编辑规则</button>
+        <div v-for="cfg in configs" class="bg-white p-6 rounded-[2rem] border shadow-sm flex justify-between items-center">
+          <p class="font-bold">{{cfg.name}}</p>
+          <button @click="editConfig(cfg)" class="text-blue-600 font-bold bg-blue-50 px-4 py-2 rounded-xl text-sm">配置机器人 & 规则</button>
+        </div>
+      </div>
+
+      <div v-if="showConfigModal" class="fixed inset-0 z-50 flex items-center justify-center p-4">
+        <div class="absolute inset-0 bg-slate-900/40 backdrop-blur-md" @click="showConfigModal=false"></div>
+        <div class="relative bg-white w-full max-w-lg rounded-[2.5rem] p-8 shadow-2xl flex flex-col max-h-[90vh]">
+          <h3 class="text-xl font-black mb-6">编辑规则集</h3>
+          
+          <div class="overflow-y-auto space-y-6">
+            <section>
+              <label class="text-xs font-bold text-slate-400 ml-2">配置名称</label>
+              <input v-model="configForm.name" class="w-full bg-slate-50 p-4 rounded-2xl font-bold outline-none border border-slate-100">
+            </section>
+
+            <section>
+              <label class="text-xs font-bold text-slate-400 ml-2">应用到以下机器人 (可多选)</label>
+              <div class="flex flex-wrap gap-2 mt-2">
+                <div v-for="bot in bots" @click="toggleBot(bot.token_hash)" 
+                     :class="configForm.botHashes.includes(bot.token_hash)?'bg-blue-600 text-white border-blue-600':'bg-white text-slate-500 border-slate-200'"
+                     class="px-4 py-2 rounded-xl border font-bold text-xs cursor-pointer transition-all">
+                  {{bot.name}}
+                </div>
+              </div>
+            </section>
+
+            <section>
+              <label class="text-xs font-bold text-slate-400 ml-2">回复规则</label>
+              <div class="space-y-2 mt-2">
+                <div v-for="(rule, index) in rulesList" class="flex gap-2">
+                  <input v-model="rule.key" placeholder="/cmd" class="w-1/4 bg-slate-50 p-3 rounded-xl border text-sm font-mono outline-none">
+                  <input v-model="rule.val" placeholder="回复内容" class="flex-1 bg-slate-50 p-3 rounded-xl border text-sm outline-none">
+                  <button @click="rulesList.splice(index,1)" class="text-red-400 px-2 font-bold">×</button>
+                </div>
+                <button @click="rulesList.push({key:'',val:''})" class="w-full py-3 border-2 border-dashed rounded-2xl text-slate-400 text-xs font-bold">+ 添加规则</button>
+              </section>
+          </div>
+
+          <button @click="saveConfig" class="w-full bg-blue-600 text-white font-bold py-4 rounded-2xl mt-6 shadow-lg active:scale-95 transition-all">保存规则集</button>
         </div>
       </div>
 
       <div v-if="showBotModal" class="fixed inset-0 z-50 flex items-center justify-center p-4">
         <div class="absolute inset-0 bg-slate-900/40 backdrop-blur-md" @click="showBotModal=false"></div>
         <div class="relative bg-white w-full max-w-sm rounded-[2.5rem] p-8 shadow-2xl">
-          <h3 class="text-xl font-black mb-6">Bot 设置</h3>
-          <div class="space-y-4">
-            <input v-model="botForm.name" placeholder="机器人名称" class="w-full bg-slate-50 p-4 rounded-2xl border border-slate-100 outline-none focus:border-blue-500">
-            <input v-model="botForm.token" placeholder="Bot Token" class="w-full bg-slate-50 p-4 rounded-2xl border border-slate-100 outline-none font-mono text-xs focus:border-blue-500">
-            <div class="relative">
-              <select v-model="botForm.config_id" class="w-full bg-slate-50 p-4 rounded-2xl border border-slate-100 outline-none appearance-none focus:border-blue-500 text-slate-600">
-                <option :value="null">-- 不关联配置 --</option>
-                <option v-for="c in configs" :value="c.id">{{c.name}}</option>
-              </select>
-            </div>
-          </div>
-          <button @click="saveBot" class="w-full bg-blue-600 text-white font-bold py-4 rounded-2xl mt-8 shadow-lg shadow-blue-200 active:scale-95 transition-all">保存更改</button>
-        </div>
-      </div>
-
-      <div v-if="showConfigModal" class="fixed inset-0 z-50 flex items-center justify-center p-4">
-        <div class="absolute inset-0 bg-slate-900/40 backdrop-blur-md" @click="showConfigModal=false"></div>
-        <div class="relative bg-white w-full max-w-lg rounded-[2.5rem] p-8 shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
-          <h3 class="text-xl font-black mb-6">编辑规则集</h3>
-          <input v-model="configForm.name" placeholder="配置名称" class="w-full bg-slate-50 p-4 rounded-2xl font-bold outline-none border border-slate-100 mb-6">
-          
-          <div class="flex-1 overflow-y-auto pr-2 space-y-3">
-            <div v-for="(rule, index) in rulesList" :key="index" class="flex gap-2 group animate-in slide-in-from-right-2">
-              <input v-model="rule.key" placeholder="/指令" class="w-1/3 bg-slate-50 p-3 rounded-xl border border-slate-100 text-sm font-mono outline-none focus:border-blue-500">
-              <input v-model="rule.val" placeholder="回复文字或图片链接" class="flex-1 bg-slate-50 p-3 rounded-xl border border-slate-100 text-sm outline-none focus:border-blue-500">
-              <button @click="removeRule(index)" class="text-slate-300 hover:text-red-500 font-bold px-2">×</button>
-            </div>
-          </div>
-
-          <button @click="addRule" class="mt-4 border-2 border-dashed border-slate-200 text-slate-400 py-3 rounded-2xl font-bold text-sm hover:bg-slate-50 transition-colors">+ 添加新指令</button>
-          <button @click="saveConfig" class="w-full bg-blue-600 text-white font-bold py-4 rounded-2xl mt-6 shadow-lg shadow-blue-200 active:scale-95 transition-all">保存并应用</button>
+          <h3 class="text-xl font-black mb-6">机器人信息</h3>
+          <input v-model="botForm.name" placeholder="备注名" class="w-full bg-slate-50 p-4 rounded-2xl border mb-4 outline-none">
+          <input v-model="botForm.token" placeholder="Bot Token" class="w-full bg-slate-50 p-4 rounded-2xl border mb-8 outline-none font-mono text-xs">
+          <button @click="saveBot" class="w-full bg-blue-600 text-white font-bold py-4 rounded-2xl shadow-lg shadow-blue-200">完成</button>
         </div>
       </div>
     </div>
@@ -177,38 +203,45 @@ function renderAdminHTML() {
       createApp({
         data() {
           return {
-            tab: 'bots', bots: [], configs: [],
+            tab: 'bots', bots: [], configs: [], refs: [],
             showBotModal: false, showConfigModal: false,
-            botForm: { name: '', token: '', config_id: null },
-            configForm: { id: null, name: '' },
-            rulesList: [] // 找回的键值对列表
+            botForm: { name: '', token: '' },
+            configForm: { id: null, name: '', botHashes: [] },
+            rulesList: []
           }
         },
         methods: {
           async load() {
             const r = await fetch('/api/data');
             const d = await r.json();
-            this.bots = d.bots; this.configs = d.configs;
+            this.bots = d.bots; this.configs = d.configs; this.refs = d.refs;
           },
-          openBotModal() { this.botForm = { name: '', token: '', config_id: null }; this.showBotModal = true; },
+          openBotModal() { this.botForm = { name: '', token: '' }; this.showBotModal = true; },
           editBot(bot) { this.botForm = { ...bot }; this.showBotModal = true; },
           async saveBot() {
             await fetch('/api/bot/save', { method: 'POST', body: JSON.stringify(this.botForm) });
             this.showBotModal = false; this.load();
           },
-          openConfigModal() { 
-            this.configForm = { id: null, name: '' }; 
-            this.rulesList = [{ key: '/start', val: '你好！' }];
-            this.showConfigModal = true; 
-          },
-          editConfig(cfg) {
-            this.configForm = { id: cfg.id, name: cfg.name };
-            const rawRules = typeof cfg.rules === 'string' ? JSON.parse(cfg.rules || '{}') : cfg.rules;
-            this.rulesList = Object.entries(rawRules).map(([k, v]) => ({ key: k, val: v }));
+          openConfigModal() {
+            this.configForm = { id: null, name: '', botHashes: [] };
+            this.rulesList = [{ key: '/start', val: '' }];
             this.showConfigModal = true;
           },
-          addRule() { this.rulesList.push({ key: '', val: '' }); },
-          removeRule(i) { this.rulesList.splice(i, 1); },
+          editConfig(cfg) {
+            this.configForm = { 
+              id: cfg.id, 
+              name: cfg.name, 
+              botHashes: this.refs.filter(r => r.config_id === cfg.id).map(r => r.bot_hash)
+            };
+            const raw = JSON.parse(cfg.rules || '{}');
+            this.rulesList = Object.entries(raw).map(([k,v]) => ({key:k, val:v}));
+            this.showConfigModal = true;
+          },
+          toggleBot(hash) {
+            const idx = this.configForm.botHashes.indexOf(hash);
+            if (idx > -1) this.configForm.botHashes.splice(idx, 1);
+            else this.configForm.botHashes.push(hash);
+          },
           async saveConfig() {
             const rulesObj = {};
             this.rulesList.forEach(r => { if(r.key) rulesObj[r.key] = r.val; });
@@ -224,5 +257,5 @@ function renderAdminHTML() {
 }
 
 function renderLoginHTML() {
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><script src="https://cdn.tailwindcss.com"></script><title>Login</title></head><body class="bg-slate-900 flex items-center justify-center min-h-screen p-4"><div class="bg-white p-8 rounded-[2rem] shadow-2xl w-full max-w-sm text-center"><h1 class="text-2xl font-black mb-6">Bot Master</h1><input id="u" type="text" placeholder="User" class="w-full p-4 bg-slate-50 rounded-2xl mb-3 outline-none border focus:border-blue-500"><input id="p" type="password" placeholder="Pass" class="w-full p-4 bg-slate-50 rounded-2xl mb-6 outline-none border focus:border-blue-500"><button onclick="login()" class="w-full bg-blue-600 text-white font-bold py-4 rounded-2xl shadow-lg shadow-blue-200">登录系统</button></div><script>async function login(){const r = await fetch('/api/login',{method:'POST',body:JSON.stringify({user:document.getElementById('u').value,pass:document.getElementById('p').value})});if(r.ok) location.href='/admin'; else alert('账号或密码错误');}</script></body></html>`;
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-slate-900 flex items-center justify-center min-h-screen p-4"><div class="bg-white p-8 rounded-[2rem] shadow-2xl w-full max-w-sm text-center"><h1 class="text-2xl font-black mb-6">Bot Master</h1><input id="u" type="text" placeholder="User" class="w-full p-4 bg-slate-50 rounded-2xl mb-3 border outline-none"><input id="p" type="password" placeholder="Pass" class="w-full p-4 bg-slate-50 rounded-2xl mb-6 border outline-none"><button onclick="login()" class="w-full bg-blue-600 text-white font-bold py-4 rounded-2xl shadow-lg">Login</button></div><script>async function login(){const r = await fetch('/api/login',{method:'POST',body:JSON.stringify({user:document.getElementById('u').value,pass:document.getElementById('p').value})});if(r.ok) location.href='/admin'; else alert('Error');}</script></body></html>`;
 }
