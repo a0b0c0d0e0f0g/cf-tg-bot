@@ -7,6 +7,12 @@ binding = "TG_BOT_KV"
 id = "0356a15a1f3442d28dfd132869bc1e26"
 
 
+[[d1_databases]]
+binding = "DB" # 必须是 DB，代码中引用的是这个名字
+database_name = "tg-bot"
+database_id = "95d33c2e-1568-4f1a-9d9a-95365e3f2aa9"
+
+
 # 2. 生产环境配置
 [vars]
 # 默认管理员账号
