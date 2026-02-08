@@ -2,9 +2,6 @@ name = "cf-tg-bot"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
 
-[[kv_namespaces]]
-binding = "TG_BOT_KV"
-id = "0356a15a1f3442d28dfd132869bc1e26"
 
 
 [[d1_databases]]
