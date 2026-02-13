@@ -10,6 +10,12 @@ database_name = "tg-bot"
 database_id = "95d33c2e-1568-4f1a-9d9a-95365e3f2aa9"
 
 
+[[kv_namespaces]]
+binding = "LIMIT_KV" # 代码中使用的变量名，必须为 LIMIT_KV
+id = "556363f6ea01455682858741bade71e5" # 你创建的 KV 命名空间 ID
+
+
+
 # 2. 生产环境配置
 [vars]
 # 默认管理员账号
