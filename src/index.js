@@ -6,7 +6,7 @@ export default {
     const cookies = Object.fromEntries(cookieHeader.split('; ').map(x => x.split('=')));
     const isAuthed = cookies['session'] === env.SESSION_SECRET;
 
-    // --- 1. API 逻辑 ---
+    // --- 1. 后台 API 逻辑 ---
     if (path === "/api/login" && request.method === "POST") {
       const { user, pass } = await request.json();
       if (user === env.ADMIN_USER && pass === env.ADMIN_PASS) {
@@ -58,15 +58,16 @@ export default {
       }
     }
 
-    // --- 2. Webhook 核心：冷却检查 + 提示删除 ---
+    // --- 2. Webhook 核心：含错误捕获与冷却反馈 ---
     if (path.startsWith("/webhook/")) {
       const tokenHash = path.split("/")[2];
       const bot = await env.DB.prepare("SELECT token FROM bots WHERE token_hash = ?").bind(tokenHash).first();
       if (!bot) return new Response("OK");
 
-      const update = await request.json();
-      let incomingText = "", msgContext = null, userId = null;
+      let update;
+      try { update = await request.json(); } catch (e) { return new Response("OK"); }
 
+      let incomingText = "", msgContext = null, userId = null;
       if (update.message?.text) {
         incomingText = update.message.text;
         msgContext = update.message;
@@ -82,33 +83,62 @@ export default {
       }
 
       if (incomingText && userId) {
-        const rawParts = incomingText.trim().split(/\s+/).filter(p => p.length > 0);
-        if (rawParts.length > 0) {
-          const cmd = rawParts[0].split('@')[0];
-          const args = rawParts.slice(1);
-          const data = await env.DB.prepare("SELECT c.rules FROM configs c JOIN bot_config_refs r ON c.id = r.config_id WHERE r.bot_hash = ?").bind(tokenHash).all();
-          let rules = {};
-          data.results.forEach(row => { try { Object.assign(rules, JSON.parse(row.rules)); } catch(e){} });
+        try {
+          const rawParts = incomingText.trim().split(/\s+/).filter(p => p.length > 0);
+          if (rawParts.length > 0) {
+            const cmd = rawParts[0].split('@')[0];
+            const args = rawParts.slice(1);
+            
+            const data = await env.DB.prepare("SELECT c.rules FROM configs c JOIN bot_config_refs r ON c.id = r.config_id WHERE r.bot_hash = ?").bind(tokenHash).all();
+            let rules = {};
+            data.results.forEach(row => { try { Object.assign(rules, JSON.parse(row.rules)); } catch(e){} });
 
-          let template = rules[cmd];
-          if (template) {
-            const parts = template.split("|||SEP|||");
-            const cooldownSec = parseInt(parts[3]) || 0;
+            let template = rules[cmd];
+            if (template) {
+              const parts = template.split("|||SEP|||");
+              const bodyText = parts[0] || "", btnArea = parts[1] || "", waitText = parts[2] || "", cooldownSec = parseInt(parts[3]) || 0;
 
-            // 频率限制检查
-            if (cooldownSec > 0 && env.LIMIT_KV) {
-              const kvKey = `limit:${tokenHash}:${userId}:${cmd}`;
-              const lastTime = await env.LIMIT_KV.get(kvKey);
-              const now = Date.now();
-              if (lastTime && (now - parseInt(lastTime)) < cooldownSec * 1000) return new Response("OK");
-              await env.LIMIT_KV.put(kvKey, now.toString(), { expirationTtl: cooldownSec });
+              // --- 冷却检查逻辑 ---
+              if (cooldownSec > 0) {
+                if (!env.LIMIT_KV) throw new Error("未绑定 LIMIT_KV 空间，无法使用冷却功能。");
+                const kvKey = `limit:${tokenHash}:${userId}:${cmd}`;
+                const lastTimeStr = await env.LIMIT_KV.get(kvKey);
+                const now = Date.now();
+                if (lastTimeStr) {
+                  const diff = now - parseInt(lastTimeStr);
+                  if (diff < cooldownSec * 1000) {
+                    const remain = Math.ceil((cooldownSec * 1000 - diff) / 1000);
+                    await fetch(`https://api.telegram.org/bot${bot.token}/sendMessage`, {
+                      method: "POST", headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ 
+                        chat_id: msgContext.chat.id, 
+                        text: `❄️ <b>冷却中</b>\n\n剩余时间: <code>${remain}s</code>\n总计间隔: <code>${cooldownSec}s</code>`,
+                        parse_mode: "HTML"
+                      })
+                    });
+                    return new Response("OK");
+                  }
+                }
+                await env.LIMIT_KV.put(kvKey, now.toString(), { expirationTtl: Math.max(cooldownSec, 60) });
+              }
+
+              // --- 执行回复 ---
+              let finalReply = template;
+              for (let i = 1; i <= 9; i++) finalReply = finalReply.replace(new RegExp(`\\{\\{${i}\\}\\}`, 'g'), args[i-1] || "");
+              finalReply = finalReply.replace(/\{\{name\}\}/g, args[0] || "");
+              await handleBotReply(msgContext, bot.token, finalReply);
             }
-
-            let finalReply = template;
-            for (let i = 1; i <= 9; i++) finalReply = finalReply.replace(new RegExp(`\\{\\{${i}\\}\\}`, 'g'), args[i-1] || "");
-            finalReply = finalReply.replace(/\{\{name\}\}/g, args[0] || "");
-            await handleBotReply(msgContext, bot.token, finalReply);
           }
+        } catch (err) {
+          // --- 全局错误上报 ---
+          await fetch(`https://api.telegram.org/bot${bot.token}/sendMessage`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ 
+              chat_id: msgContext.chat.id, 
+              text: `❌ <b>运行错误</b>\n\n原因: <code>${err.message}</code>`,
+              parse_mode: "HTML"
+            })
+          });
         }
       }
       return new Response("OK");
@@ -120,7 +150,7 @@ export default {
   }
 };
 
-// --- 3. 核心回复逻辑 ---
+// --- 3. 消息发送逻辑 ---
 async function handleBotReply(msg, token, reply) {
   const botUrl = `https://api.telegram.org/bot${token}`;
   const parts = reply.split("|||SEP|||");
@@ -163,8 +193,9 @@ async function handleBotReply(msg, token, reply) {
     payload.text = bodyText || "Done";
   }
 
-  await fetch(`${botUrl}/${method}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-  
+  const mainRes = await fetch(`${botUrl}/${method}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+  if (!mainRes.ok) throw new Error(`TG接口报错: ${(await mainRes.json()).description}`);
+
   if (waitMsgId) {
     await fetch(`${botUrl}/deleteMessage`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ chat_id: msg.chat.id, message_id: waitMsgId }) });
   }
@@ -175,9 +206,9 @@ async function sha256(str) {
   return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
-// --- 4. 后台 UI ---
+// --- 4. 后台渲染 ---
 function renderAdminHTML() {
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0"><script src="https://cdn.tailwindcss.com"></script><script src="https://unpkg.com/vue@3/dist/vue.global.js"></script><title>BotMaster v4</title>
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0"><script src="https://cdn.tailwindcss.com"></script><script src="https://unpkg.com/vue@3/dist/vue.global.js"></script><title>BotMaster v5</title>
   <style>[v-cloak] { display: none; } .full-drawer { position: fixed; inset: 0; z-index: 100; background: white; display: flex; flex-direction: column; }</style></head>
   <body class="bg-slate-50 text-slate-900 font-sans">
     <div id="app" v-cloak class="max-w-2xl mx-auto p-4 pb-24">
@@ -187,7 +218,7 @@ function renderAdminHTML() {
       </div>
 
       <div v-if="tab==='bots'" class="space-y-4">
-        <div v-for="bot in bots" class="bg-white p-5 rounded-[2rem] border flex justify-between items-center shadow-sm hover:shadow-md transition-shadow">
+        <div v-for="bot in bots" class="bg-white p-5 rounded-[2rem] border flex justify-between items-center shadow-sm">
           <div><p class="font-bold text-lg text-slate-800">{{bot.name}}</p></div>
           <button @click="editBot(bot)" class="bg-blue-50 text-blue-600 font-bold px-5 py-2 rounded-xl text-sm">设置</button>
         </div>
@@ -195,7 +226,7 @@ function renderAdminHTML() {
       </div>
 
       <div v-if="tab==='configs'" class="space-y-4">
-        <div v-for="cfg in configs" class="bg-white p-6 rounded-[2rem] border flex justify-between items-center shadow-sm hover:shadow-md transition-shadow">
+        <div v-for="cfg in configs" class="bg-white p-6 rounded-[2rem] border flex justify-between items-center shadow-sm">
           <p class="font-bold text-lg text-slate-800">{{cfg.name}}</p>
           <button @click="editConfig(cfg)" class="bg-slate-900 text-white font-bold px-5 py-2 rounded-xl text-sm">编辑规则</button>
         </div>
@@ -216,54 +247,32 @@ function renderAdminHTML() {
             </div>
           </section>
           <section>
-            <label class="text-[10px] font-black text-slate-400 uppercase ml-1">指令卡片 (不同用户独立冷却)</label>
+            <label class="text-[10px] font-black text-slate-400 uppercase ml-1">指令卡片配置</label>
             <div class="space-y-4 mt-3">
               <div v-for="(rule, idx) in rulesList" :key="idx" class="p-6 bg-slate-50 rounded-[2.5rem] border border-slate-200 relative shadow-inner">
                 <input v-model="rule.key" placeholder="/指令" class="w-full bg-transparent font-mono font-bold text-blue-600 border-b border-slate-200 pb-2 mb-4 outline-none">
-                
                 <div class="grid grid-cols-2 gap-3 mb-4">
-                  <div>
-                    <label class="text-[10px] font-black text-slate-500 uppercase">等待提示 (自动删除)</label>
-                    <input v-model="rule.wait" placeholder="正在处理..." class="w-full bg-white p-3 rounded-xl text-sm mt-1 outline-none shadow-sm">
-                  </div>
-                  <div>
-                    <label class="text-[10px] font-black text-slate-500 uppercase">冷却限制 (秒)</label>
-                    <input type="number" v-model="rule.cooldown" placeholder="0" class="w-full bg-white p-3 rounded-xl text-sm mt-1 outline-none shadow-sm">
-                  </div>
+                  <div><label class="text-[10px] font-black text-slate-500 uppercase">等待提示</label><input v-model="rule.wait" placeholder="正在发送..." class="w-full bg-white p-3 rounded-xl text-sm mt-1 outline-none shadow-sm"></div>
+                  <div><label class="text-[10px] font-black text-slate-500 uppercase">冷却(秒)</label><input type="number" v-model="rule.cooldown" placeholder="0" class="w-full bg-white p-3 rounded-xl text-sm mt-1 outline-none shadow-sm"></div>
                 </div>
-
-                <div class="mb-4">
-                  <label class="text-[10px] font-black text-slate-500 uppercase">回复文本 / 图片链接</label>
-                  <textarea v-model="rule.val" rows="3" placeholder="支持 HTML 内容" class="w-full bg-white p-3 rounded-xl text-sm mt-1 outline-none shadow-sm"></textarea>
-                </div>
-
-                <div>
-                  <label class="text-[10px] font-black text-slate-500 uppercase">交互按钮 [文字|/指令] 或 [文字|链接]</label>
-                  <input v-model="rule.btns" placeholder="[换一张|/bing] [官网|https://...]" class="w-full bg-white p-3 rounded-xl text-xs mt-1 outline-none shadow-sm font-mono">
-                </div>
-
-                <button @click="rulesList.splice(idx,1)" class="absolute -top-2 -right-2 bg-white text-red-500 w-8 h-8 rounded-full shadow-md border flex items-center justify-center">✕</button>
+                <div class="mb-4"><label class="text-[10px] font-black text-slate-500 uppercase">回复文本/URL</label><textarea v-model="rule.val" rows="3" class="w-full bg-white p-3 rounded-xl text-sm mt-1 outline-none shadow-sm"></textarea></div>
+                <div><label class="text-[10px] font-black text-slate-500 uppercase">交互按钮</label><input v-model="rule.btns" placeholder="[文字|/指令]" class="w-full bg-white p-3 rounded-xl text-xs mt-1 outline-none shadow-sm font-mono"></div>
+                <button @click="rulesList.splice(idx,1)" class="absolute -top-2 -right-2 bg-white text-red-500 w-8 h-8 rounded-full shadow-md border">✕</button>
               </div>
-              <button @click="rulesList.push({key:'',val:'',btns:'',wait:'',cooldown:0})" class="w-full py-4 border-2 border-dashed border-slate-300 rounded-2xl text-slate-400 font-bold">+ 新增指令配置</button>
+              <button @click="rulesList.push({key:'',val:'',btns:'',wait:'',cooldown:0})" class="w-full py-4 border-2 border-dashed border-slate-300 rounded-2xl text-slate-400 font-bold">+ 新增指令</button>
             </div>
           </section>
         </div>
-        <div class="p-6 bg-white border-t grid grid-cols-3 gap-3">
-          <button v-if="configForm.id" @click="deleteConfig" class="bg-red-50 text-red-600 font-bold py-4 rounded-2xl">删除</button>
-          <button @click="saveConfig" :class="configForm.id?'col-span-2':'col-span-3'" class="bg-blue-600 text-white font-bold py-4 rounded-2xl shadow-xl">提交保存</button>
-        </div>
+        <div class="p-6 bg-white border-t grid grid-cols-3 gap-3"><button v-if="configForm.id" @click="deleteConfig" class="bg-red-50 text-red-600 font-bold py-4 rounded-2xl">删除</button><button @click="saveConfig" :class="configForm.id?'col-span-2':'col-span-3'" class="bg-blue-600 text-white font-bold py-4 rounded-2xl">保存应用</button></div>
       </div>
 
       <div v-if="showBotModal" class="full-drawer">
         <div class="p-6 border-b flex justify-between items-center bg-white"><button @click="showBotModal=false" class="text-slate-400">取消</button><h3 class="font-black text-xl">机器人配置</h3><div class="w-10"></div></div>
         <div class="p-6 space-y-6 flex-1 overflow-y-auto">
-          <section><label class="text-[10px] font-black text-slate-400 uppercase">显示名称</label><input v-model="botForm.name" class="w-full bg-slate-50 p-5 rounded-3xl mt-2 outline-none font-bold"></section>
-          <section><label class="text-[10px] font-black text-slate-400 uppercase">Telegram Token</label><textarea v-model="botForm.token" rows="4" class="w-full bg-slate-50 p-5 rounded-3xl mt-2 font-mono text-xs outline-none"></textarea></section>
+          <section><label class="text-[10px] font-black text-slate-400 uppercase">备注名</label><input v-model="botForm.name" class="w-full bg-slate-50 p-5 rounded-3xl mt-2 outline-none font-bold"></section>
+          <section><label class="text-[10px] font-black text-slate-400 uppercase">Token</label><textarea v-model="botForm.token" rows="4" class="w-full bg-slate-50 p-5 rounded-3xl mt-2 font-mono text-xs outline-none"></textarea></section>
         </div>
-        <div class="p-6 bg-white border-t grid grid-cols-3 gap-3">
-          <button v-if="botForm.token_hash" @click="deleteBot(botForm.token_hash)" class="bg-red-50 text-red-600 font-bold py-4 rounded-2xl">删除</button>
-          <button @click="saveBot" :class="botForm.token_hash?'col-span-2':'col-span-3'" class="bg-blue-600 text-white font-bold py-4 rounded-2xl shadow-xl">保存机器人</button>
-        </div>
+        <div class="p-6 bg-white border-t grid grid-cols-3 gap-3"><button v-if="botForm.token_hash" @click="deleteBot(botForm.token_hash)" class="bg-red-50 text-red-600 font-bold py-4 rounded-2xl">删除</button><button @click="saveBot" :class="botForm.token_hash?'col-span-2':'col-span-3'" class="bg-blue-600 text-white font-bold py-4 rounded-2xl">保存</button></div>
       </div>
     </div>
     <script>
@@ -274,7 +283,7 @@ function renderAdminHTML() {
           async load() { const r = await fetch('/api/data'); const d = await r.json(); this.bots = d.bots; this.configs = d.configs; this.refs = d.refs; },
           openBotModal() { this.botForm = { name: '', token: '', token_hash: null }; this.showBotModal = true; },
           editBot(bot) { this.botForm = { ...bot }; this.showBotModal = true; },
-          async deleteBot(h) { if(confirm('彻底删除此机器人？')){ await fetch('/api/bot/delete',{method:'POST',body:JSON.stringify({token_hash:h})}); this.showBotModal=false; this.load(); } },
+          async deleteBot(h) { if(confirm('删除机器人？')){ await fetch('/api/bot/delete',{method:'POST',body:JSON.stringify({token_hash:h})}); this.showBotModal=false; this.load(); } },
           async saveBot() { await fetch('/api/bot/save',{method:'POST',body:JSON.stringify(this.botForm)}); this.showBotModal=false; this.load(); },
           openConfigModal() { this.configForm={id:null,name:'',botHashes:[]}; this.rulesList=[{key:'/start',val:'',btns:'',wait:'',cooldown:0}]; this.showConfigModal=true; },
           editConfig(cfg) {
@@ -286,7 +295,7 @@ function renderAdminHTML() {
             });
             this.showConfigModal = true;
           },
-          async deleteConfig() { if(confirm('删除此规则集？')){ await fetch('/api/config/delete',{method:'POST',body:JSON.stringify({id:this.configForm.id})}); this.showConfigModal=false; this.load(); } },
+          async deleteConfig() { if(confirm('删除规则集？')){ await fetch('/api/config/delete',{method:'POST',body:JSON.stringify({id:this.configForm.id})}); this.showConfigModal=false; this.load(); } },
           toggleBot(h) { const i=this.configForm.botHashes.indexOf(h); if(i>-1) this.configForm.botHashes.splice(i,1); else this.configForm.botHashes.push(h); },
           async saveConfig() {
             const obj = {};
