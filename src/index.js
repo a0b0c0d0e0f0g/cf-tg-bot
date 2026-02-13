@@ -6,7 +6,7 @@ export default {
     const cookies = Object.fromEntries(cookieHeader.split('; ').map(x => x.split('=')));
     const isAuthed = cookies['session'] === env.SESSION_SECRET;
 
-    // --- API 逻辑 ---
+    // --- 1. 登录与基础 API ---
     if (path === "/api/login" && request.method === "POST") {
       const { user, pass } = await request.json();
       if (user === env.ADMIN_USER && pass === env.ADMIN_PASS) {
@@ -28,9 +28,8 @@ export default {
       if (path === "/api/config/save" && request.method === "POST") {
         const { id, name, rules, botHashes } = await request.json();
         let configId = id;
-        if (id) {
-          await env.DB.prepare("UPDATE configs SET name = ?, rules = ? WHERE id = ?").bind(name, rules, id).run();
-        } else {
+        if (id) await env.DB.prepare("UPDATE configs SET name = ?, rules = ? WHERE id = ?").bind(name, rules, id).run();
+        else {
           const res = await env.DB.prepare("INSERT INTO configs (name, rules) VALUES (?, ?)").bind(name, rules).run();
           configId = res.meta.last_row_id;
         }
@@ -65,35 +64,53 @@ export default {
       }
     }
 
-    // --- Webhook 核心解析 ---
+    // --- 2. Webhook 消息与按钮点击处理 ---
     if (path.startsWith("/webhook/")) {
       const tokenHash = path.split("/")[2];
-      const botInfo = await env.DB.prepare("SELECT token FROM bots WHERE token_hash = ?").bind(tokenHash).first();
-      const data = await env.DB.prepare("SELECT c.rules FROM configs c JOIN bot_config_refs r ON c.id = r.config_id WHERE r.bot_hash = ?").bind(tokenHash).all();
-      
-      if (!botInfo || !data.results.length) return new Response("OK");
+      const bot = await env.DB.prepare("SELECT token FROM bots WHERE token_hash = ?").bind(tokenHash).first();
+      if (!bot) return new Response("OK");
 
       const update = await request.json();
-      const msg = update.message;
-      if (!msg?.text) return new Response("OK");
+      let incomingText = "";
+      let msgContext = null;
 
-      const rawParts = msg.text.trim().split(/\s+/).filter(p => p.length > 0);
-      if (rawParts.length === 0) return new Response("OK");
+      // 普通文字消息
+      if (update.message?.text) {
+        incomingText = update.message.text;
+        msgContext = update.message;
+      } 
+      // 按钮点击回调
+      else if (update.callback_query) {
+        incomingText = update.callback_query.data;
+        msgContext = update.callback_query.message;
+        // 回应 Telegram 消除转圈
+        await fetch(`https://api.telegram.org/bot${bot.token}/answerCallbackQuery`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ callback_query_id: update.callback_query.id })
+        });
+      }
 
-      const cmd = rawParts[0].split('@')[0]; 
-      const args = rawParts.slice(1);
+      if (incomingText) {
+        const rawParts = incomingText.trim().split(/\s+/).filter(p => p.length > 0);
+        if (rawParts.length > 0) {
+          const cmd = rawParts[0].split('@')[0];
+          const args = rawParts.slice(1);
+          
+          const data = await env.DB.prepare("SELECT c.rules FROM configs c JOIN bot_config_refs r ON c.id = r.config_id WHERE r.bot_hash = ?").bind(tokenHash).all();
+          let rules = {};
+          data.results.forEach(row => { try { Object.assign(rules, JSON.parse(row.rules)); } catch(e){} });
 
-      let rules = {};
-      data.results.forEach(row => { try { Object.assign(rules, JSON.parse(row.rules)); } catch(e){} });
-
-      let template = rules[cmd];
-      if (template) {
-        let finalReply = template;
-        for (let i = 1; i <= 9; i++) {
-          finalReply = finalReply.replace(new RegExp(`\\{\\{${i}\\}\\}`, 'g'), args[i-1] || "");
+          let template = rules[cmd];
+          if (template) {
+            let finalReply = template;
+            // 参数替换 {{1}} - {{9}}
+            for (let i = 1; i <= 9; i++) {
+              finalReply = finalReply.replace(new RegExp(`\\{\\{${i}\\}\\}`, 'g'), args[i-1] || "");
+            }
+            finalReply = finalReply.replace(/\{\{name\}\}/g, args[0] || "");
+            await handleBotReply(msgContext, bot.token, finalReply.trim());
+          }
         }
-        finalReply = finalReply.replace(/\{\{name\}\}/g, args[0] || "");
-        await handleBotReply(msg, botInfo.token, finalReply.trim());
       }
       return new Response("OK");
     }
@@ -104,20 +121,26 @@ export default {
   }
 };
 
-// --- 发送逻辑: 按钮提取、图片探测、HTML ---
+// --- 3. 核心回复逻辑：按钮提取、类型判断、图片发送 ---
 async function handleBotReply(msg, token, reply) {
   const botUrl = `https://api.telegram.org/bot${token}`;
   
-  // 提取按钮 [文字|链接]
-  const btnRegex = /\[([^\]]+)\|([^\]]+)\]/g;
+  // 提取按钮 [文字|目标]
+  const btnRegex = /\[([^\]|]+)\|([^\]]+)\]/g;
   let inline_keyboard = [];
+  let currentRow = [];
   let match;
-  let buttons = [];
+  
   while ((match = btnRegex.exec(reply)) !== null) {
-    buttons.push({ text: match[1], url: match[2].trim() });
+    const text = match[1].trim();
+    const target = match[2].trim();
+    const btn = target.startsWith('http') ? { text, url: target } : { text, callback_data: target };
+    currentRow.push(btn);
+    if (currentRow.length === 2) { inline_keyboard.push(currentRow); currentRow = []; }
   }
-  if (buttons.length > 0) inline_keyboard.push(buttons);
+  if (currentRow.length > 0) inline_keyboard.push(currentRow);
 
+  // 清理正文并提取 URL
   let cleanText = reply.replace(btnRegex, '').trim();
   const urls = cleanText.match(/(https?:\/\/[^\s]+)/g);
   let firstUrl = urls ? urls[0] : null;
@@ -130,29 +153,29 @@ async function handleBotReply(msg, token, reply) {
   };
 
   if (firstUrl) {
-    const isImg = /\.(jpg|jpeg|png|gif|webp)/i.test(firstUrl) || /(api|php|img|run|image|unsplash|random)/i.test(firstUrl);
+    const isImg = /\.(jpg|jpeg|png|gif|webp)/i.test(firstUrl) || /(api|php|img|run|image|unsplash|random|pic)/i.test(firstUrl);
     if (isImg) {
       method = "sendPhoto";
       const sep = firstUrl.includes('?') ? '&' : '?';
       payload.photo = `${firstUrl}${sep}t=${Date.now()}`;
-      payload.caption = caption;
+      if (caption) payload.caption = caption;
     } else {
       payload.text = cleanText;
     }
   } else {
-    payload.text = cleanText;
+    payload.text = cleanText || "（无文字内容）";
   }
 
   const res = await fetch(`${botUrl}/${method}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
+    method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
   });
 
-  if (!res.ok) { // 降级处理
-    delete payload.parse_mode;
-    if (method === "sendPhoto") { method = "sendMessage"; payload.text = cleanText; delete payload.photo; }
-    await fetch(`${botUrl}/${method}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+  if (!res.ok) {
+    await fetch(`${botUrl}/sendMessage`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: msg.chat.id, text: cleanText + (firstUrl ? "\\n" + firstUrl : "") })
+    });
   }
 }
 
@@ -161,9 +184,9 @@ async function sha256(str) {
   return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
-// --- 后台界面 (卡片式可视化编辑) ---
+// --- 4. 后台界面渲染 ---
 function renderAdminHTML() {
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0"><script src="https://cdn.tailwindcss.com"></script><script src="https://unpkg.com/vue@3/dist/vue.global.js"></script><title>BotMaster v2</title>
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0"><script src="https://cdn.tailwindcss.com"></script><script src="https://unpkg.com/vue@3/dist/vue.global.js"></script><title>BotMaster v2.1</title>
   <style>[v-cloak] { display: none; } .full-drawer { position: fixed; inset: 0; z-index: 100; background: white; display: flex; flex-direction: column; }</style></head>
   <body class="bg-slate-50 text-slate-900">
     <div id="app" v-cloak class="max-w-2xl mx-auto p-4 pb-24">
@@ -191,46 +214,46 @@ function renderAdminHTML() {
       <div v-if="showConfigModal" class="full-drawer animate-in slide-in-from-bottom duration-300">
         <div class="p-6 border-b flex justify-between items-center bg-white sticky top-0 z-10">
           <button @click="showConfigModal=false" class="text-slate-400">取消</button>
-          <h3 class="font-black text-xl">编辑规则集</h3>
+          <h3 class="font-black text-xl text-center">编辑规则集</h3>
           <button @click="saveConfig" class="text-blue-600 font-bold">保存</button>
         </div>
         <div class="flex-1 overflow-y-auto p-6 space-y-6">
-          <section><label class="text-[10px] font-black text-slate-400 uppercase ml-1">名称</label><input v-model="configForm.name" class="w-full bg-slate-50 p-4 rounded-2xl font-bold mt-2 outline-none"></section>
-          <section><label class="text-[10px] font-black text-slate-400 uppercase ml-1">应用机器人</label>
+          <section><label class="text-[10px] font-black text-slate-400 uppercase ml-1">规则集名称</label><input v-model="configForm.name" class="w-full bg-slate-50 p-4 rounded-2xl font-bold mt-2 outline-none"></section>
+          <section><label class="text-[10px] font-black text-slate-400 uppercase ml-1">绑定机器人</label>
             <div class="flex flex-wrap gap-2 mt-2">
               <div v-for="bot in bots" @click="toggleBot(bot.token_hash)" :class="configForm.botHashes.includes(bot.token_hash)?'bg-blue-600 text-white shadow-md':'bg-white text-slate-400 border'" class="px-4 py-2 rounded-xl text-[10px] font-bold cursor-pointer transition-all">{{bot.name}}</div>
             </div>
           </section>
           <section>
-            <label class="text-[10px] font-black text-slate-400 uppercase ml-1">指令卡片 ({{1}}-{{9}} 参数)</label>
+            <label class="text-[10px] font-black text-slate-400 uppercase ml-1">指令配置</label>
             <div class="space-y-4 mt-3">
               <div v-for="(rule, idx) in rulesList" :key="idx" class="p-6 bg-slate-50 rounded-[2rem] border border-slate-200 relative shadow-inner">
                 <input v-model="rule.key" placeholder="/指令" class="w-full bg-transparent font-mono font-bold text-blue-600 border-b border-slate-200 pb-2 mb-4 outline-none">
-                <label class="text-[10px] font-black text-slate-400 uppercase">回复文案</label>
-                <textarea v-model="rule.val" rows="2" placeholder="支持HTML标签" class="w-full bg-white p-3 rounded-xl text-sm mt-1 mb-3 outline-none shadow-sm"></textarea>
-                <label class="text-[10px] font-black text-slate-400 uppercase">按钮 [文字|链接]</label>
-                <input v-model="rule.btns" placeholder="[官网|https://...] [帮助|https://...]" class="w-full bg-white p-3 rounded-xl text-xs mt-1 outline-none shadow-sm font-mono">
+                <label class="text-[10px] font-black text-slate-400 uppercase">回复文本</label>
+                <textarea v-model="rule.val" rows="2" placeholder="支持 HTML" class="w-full bg-white p-3 rounded-xl text-sm mt-1 mb-3 outline-none"></textarea>
+                <label class="text-[10px] font-black text-slate-400 uppercase">按钮 (链接或 /指令)</label>
+                <input v-model="rule.btns" placeholder="[文字|链接] [文字|/指令]" class="w-full bg-white p-3 rounded-xl text-xs mt-1 outline-none font-mono">
                 <button @click="rulesList.splice(idx,1)" class="absolute -top-2 -right-2 bg-white text-red-500 w-8 h-8 rounded-full shadow-md border flex items-center justify-center">✕</button>
               </div>
-              <button @click="rulesList.push({key:'',val:'',btns:''})" class="w-full py-4 border-2 border-dashed border-slate-300 rounded-2xl text-slate-400 font-bold">+ 新增指令卡片</button>
+              <button @click="rulesList.push({key:'',val:'',btns:''})" class="w-full py-4 border-2 border-dashed border-slate-300 rounded-2xl text-slate-400 font-bold">+ 新增指令</button>
             </div>
           </section>
         </div>
         <div class="p-6 bg-white border-t grid grid-cols-3 gap-3">
           <button v-if="configForm.id" @click="deleteConfig" class="bg-red-50 text-red-600 font-bold py-4 rounded-2xl">删除</button>
-          <button @click="saveConfig" :class="configForm.id?'col-span-2':'col-span-3'" class="bg-blue-600 text-white font-bold py-4 rounded-2xl shadow-xl">提交并应用</button>
+          <button @click="saveConfig" :class="configForm.id?'col-span-2':'col-span-3'" class="bg-blue-600 text-white font-bold py-4 rounded-2xl shadow-xl">保存应用</button>
         </div>
       </div>
 
-      <div v-if="showBotModal" class="full-drawer animate-in slide-in-from-bottom duration-300">
-        <div class="p-6 border-b flex justify-between items-center bg-white"><button @click="showBotModal=false" class="text-slate-400">取消</button><h3 class="font-black text-xl">Bot 设置</h3><div class="w-10"></div></div>
+      <div v-if="showBotModal" class="full-drawer">
+        <div class="p-6 border-b flex justify-between items-center bg-white"><button @click="showBotModal=false" class="text-slate-400">取消</button><h3 class="font-black text-xl">机器人设置</h3><div class="w-10"></div></div>
         <div class="p-6 space-y-6 flex-1 overflow-y-auto">
-          <section><label class="text-[10px] font-black text-slate-400 uppercase ml-1">备注名</label><input v-model="botForm.name" class="w-full bg-slate-50 p-5 rounded-3xl mt-2 outline-none font-bold"></section>
-          <section><label class="text-[10px] font-black text-slate-400 uppercase ml-1">Token</label><textarea v-model="botForm.token" rows="4" class="w-full bg-slate-50 p-5 rounded-3xl mt-2 font-mono text-xs outline-none"></textarea></section>
+          <section><label class="text-[10px] font-black text-slate-400 uppercase">备注名</label><input v-model="botForm.name" class="w-full bg-slate-50 p-5 rounded-3xl mt-2 outline-none font-bold"></section>
+          <section><label class="text-[10px] font-black text-slate-400 uppercase">Token</label><textarea v-model="botForm.token" rows="4" class="w-full bg-slate-50 p-5 rounded-3xl mt-2 font-mono text-xs outline-none"></textarea></section>
         </div>
         <div class="p-6 bg-white border-t grid grid-cols-3 gap-3">
           <button v-if="botForm.token_hash" @click="deleteBot(botForm.token_hash)" class="bg-red-50 text-red-600 font-bold py-4 rounded-2xl">删除</button>
-          <button @click="saveBot" :class="botForm.token_hash?'col-span-2':'col-span-3'" class="bg-blue-600 text-white font-bold py-4 rounded-2xl shadow-xl">保存</button>
+          <button @click="saveBot" :class="botForm.token_hash?'col-span-2':'col-span-3'" class="bg-blue-600 text-white font-bold py-4 rounded-2xl">保存</button>
         </div>
       </div>
     </div>
@@ -242,20 +265,21 @@ function renderAdminHTML() {
           async load() { const r = await fetch('/api/data'); const d = await r.json(); this.bots = d.bots; this.configs = d.configs; this.refs = d.refs; },
           openBotModal() { this.botForm = { name: '', token: '', token_hash: null }; this.showBotModal = true; },
           editBot(bot) { this.botForm = { ...bot }; this.showBotModal = true; },
-          async deleteBot(hash) { if(confirm('确定删除机器人及其Webhook？')) { await fetch('/api/bot/delete', { method: 'POST', body: JSON.stringify({ token_hash: hash }) }); this.showBotModal = false; this.load(); } },
+          async deleteBot(hash) { if(confirm('确定删除机器人？')) { await fetch('/api/bot/delete', { method: 'POST', body: JSON.stringify({ token_hash: hash }) }); this.showBotModal = false; this.load(); } },
           async saveBot() { await fetch('/api/bot/save', { method: 'POST', body: JSON.stringify(this.botForm) }); this.showBotModal = false; this.load(); },
           openConfigModal() { this.configForm = { id: null, name: '', botHashes: [] }; this.rulesList = [{ key: '/start', val: '', btns: '' }]; this.showConfigModal = true; },
           editConfig(cfg) {
             this.configForm = { id: cfg.id, name: cfg.name, botHashes: this.refs.filter(r => r.config_id === cfg.id).map(r => r.bot_hash) };
             const raw = JSON.parse(cfg.rules || '{}');
             this.rulesList = Object.entries(raw).map(([k,v]) => {
-              const btnMatch = v.match(/(\[[^\]]+\|[^\]]+\]\s*)+$/);
-              const btns = btnMatch ? btnMatch[0] : "";
-              return { key: k, val: v.replace(btns, "").trim(), btns };
+              const btnMatches = v.match(/\\[[^\\]|]+\\|[^\\]]+\\]/g);
+              const btns = btnMatches ? btnMatches.join(' ') : "";
+              let text = v; if(btnMatches) btnMatches.forEach(b => text = text.replace(b, ''));
+              return { key: k, val: text.trim(), btns: btns.trim() };
             });
             this.showConfigModal = true;
           },
-          async deleteConfig() { if(confirm('确定删除此规则集？')) { await fetch('/api/config/delete', { method: 'POST', body: JSON.stringify({ id: this.configForm.id }) }); this.showConfigModal = false; this.load(); } },
+          async deleteConfig() { if(confirm('确定删除规则集？')) { await fetch('/api/config/delete', { method: 'POST', body: JSON.stringify({ id: this.configForm.id }) }); this.showConfigModal = false; this.load(); } },
           toggleBot(hash) { const idx = this.configForm.botHashes.indexOf(hash); if (idx > -1) this.configForm.botHashes.splice(idx, 1); else this.configForm.botHashes.push(hash); },
           async saveConfig() {
             const rulesObj = {};
